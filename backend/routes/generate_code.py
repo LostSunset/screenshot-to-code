@@ -6,6 +6,7 @@ import openai
 from codegen.utils import extract_html_content
 from config import (
     ANTHROPIC_API_KEY,
+    GEMINI_API_KEY,
     IS_PROD,
     NUM_VARIANTS,
     OPENAI_API_KEY,
@@ -19,6 +20,7 @@ from llm import (
     convert_frontend_str_to_llm,
     stream_claude_response,
     stream_claude_response_native,
+    stream_gemini_response,
     stream_openai_response,
 )
 from fs_logging.core import write_logs
@@ -294,7 +296,16 @@ async def stream_code(websocket: WebSocket):
                                 api_key=openai_api_key,
                                 base_url=openai_base_url,
                                 callback=lambda x, i=index: process_chunk(x, i),
-                                model=Llm.GPT_4O_2024_05_13,
+                                model=Llm.GPT_4O_2024_11_20,
+                            )
+                        )
+                    elif model == "gemini" and GEMINI_API_KEY:
+                        tasks.append(
+                            stream_gemini_response(
+                                prompt_messages,
+                                api_key=GEMINI_API_KEY,
+                                callback=lambda x, i=index: process_chunk(x, i),
+                                model=Llm.GEMINI_2_0_FLASH_EXP,
                             )
                         )
                     elif model == "anthropic":
