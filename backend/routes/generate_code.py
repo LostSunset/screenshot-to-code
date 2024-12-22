@@ -17,7 +17,6 @@ from config import (
 from custom_types import InputMode
 from llm import (
     Llm,
-    convert_frontend_str_to_llm,
     stream_claude_response,
     stream_claude_response_native,
     stream_gemini_response,
@@ -36,21 +35,6 @@ from ws.constants import APP_ERROR_WEB_SOCKET_CODE  # type: ignore
 
 
 router = APIRouter()
-
-
-# Auto-upgrade usage of older models
-def auto_upgrade_model(code_generation_model: Llm) -> Llm:
-    if code_generation_model in {Llm.GPT_4_VISION, Llm.GPT_4_TURBO_2024_04_09}:
-        print(
-            f"Initial deprecated model: {code_generation_model}. Auto-updating code generation model to GPT-4O-2024-05-13"
-        )
-        return Llm.GPT_4O_2024_05_13
-    elif code_generation_model == Llm.CLAUDE_3_SONNET:
-        print(
-            f"Initial deprecated model: {code_generation_model}. Auto-updating code generation model to CLAUDE-3.5-SONNET-2024-06-20"
-        )
-        return Llm.CLAUDE_3_5_SONNET_2024_06_20
-    return code_generation_model
 
 
 # Generate images, if needed
@@ -92,7 +76,6 @@ async def perform_image_generation(
 class ExtractedParams:
     stack: Stack
     input_mode: InputMode
-    code_generation_model: Llm
     should_generate_images: bool
     openai_api_key: str | None
     anthropic_api_key: str | None
@@ -115,16 +98,6 @@ async def extract_params(
         await throw_error(f"Invalid input mode: {input_mode}")
         raise ValueError(f"Invalid input mode: {input_mode}")
     validated_input_mode = cast(InputMode, input_mode)
-
-    # Read the model from the request. Fall back to default if not provided.
-    code_generation_model_str = params.get(
-        "codeGenerationModel", Llm.GPT_4O_2024_05_13.value
-    )
-    try:
-        code_generation_model = convert_frontend_str_to_llm(code_generation_model_str)
-    except ValueError:
-        await throw_error(f"Invalid model: {code_generation_model_str}")
-        raise ValueError(f"Invalid model: {code_generation_model_str}")
 
     openai_api_key = get_from_settings_dialog_or_env(
         params, "openAiApiKey", OPENAI_API_KEY
@@ -151,7 +124,6 @@ async def extract_params(
     return ExtractedParams(
         stack=validated_stack,
         input_mode=validated_input_mode,
-        code_generation_model=code_generation_model,
         should_generate_images=should_generate_images,
         openai_api_key=openai_api_key,
         anthropic_api_key=anthropic_api_key,
@@ -211,14 +183,10 @@ async def stream_code(websocket: WebSocket):
     extracted_params = await extract_params(params, throw_error)
     stack = extracted_params.stack
     input_mode = extracted_params.input_mode
-    code_generation_model = extracted_params.code_generation_model
     openai_api_key = extracted_params.openai_api_key
     openai_base_url = extracted_params.openai_base_url
     anthropic_api_key = extracted_params.anthropic_api_key
     should_generate_images = extracted_params.should_generate_images
-
-    # Auto-upgrade usage of older models
-    code_generation_model = auto_upgrade_model(code_generation_model)
 
     print(f"Generating {stack} code in {input_mode} mode")
 
@@ -271,12 +239,29 @@ async def stream_code(websocket: WebSocket):
                 # Depending on the presence and absence of various keys,
                 # we decide which models to run
                 variant_models = []
+
+                # For creation, use Claude Sonnet 3.6 but it can be lazy
+                # so for updates, we use Claude Sonnet 3.5
+                if params["generationType"] == "create":
+                    claude_model = Llm.CLAUDE_3_5_SONNET_2024_10_22
+                else:
+                    claude_model = Llm.CLAUDE_3_5_SONNET_2024_06_20
+
                 if openai_api_key and anthropic_api_key:
-                    variant_models = ["anthropic", "openai"]
+                    variant_models = [
+                        claude_model,
+                        Llm.GPT_4O_2024_11_20,
+                    ]
                 elif openai_api_key:
-                    variant_models = ["openai", "openai"]
+                    variant_models = [
+                        Llm.GPT_4O_2024_11_20,
+                        Llm.GPT_4O_2024_11_20,
+                    ]
                 elif anthropic_api_key:
-                    variant_models = ["anthropic", "anthropic"]
+                    variant_models = [
+                        claude_model,
+                        Llm.CLAUDE_3_5_SONNET_2024_06_20,
+                    ]
                 else:
                     await throw_error(
                         "No OpenAI or Anthropic API key found. Please add the environment variable OPENAI_API_KEY or ANTHROPIC_API_KEY to backend/.env or in the settings dialog. If you add it to .env, make sure to restart the backend server."
@@ -285,7 +270,7 @@ async def stream_code(websocket: WebSocket):
 
                 tasks: List[Coroutine[Any, Any, str]] = []
                 for index, model in enumerate(variant_models):
-                    if model == "openai":
+                    if model == Llm.GPT_4O_2024_11_20:
                         if openai_api_key is None:
                             await throw_error("OpenAI API key is missing.")
                             raise Exception("OpenAI API key is missing.")
@@ -299,7 +284,7 @@ async def stream_code(websocket: WebSocket):
                                 model=Llm.GPT_4O_2024_11_20,
                             )
                         )
-                    elif model == "gemini" and GEMINI_API_KEY:
+                    elif model == Llm.GEMINI_2_0_FLASH_EXP and GEMINI_API_KEY:
                         tasks.append(
                             stream_gemini_response(
                                 prompt_messages,
@@ -308,7 +293,10 @@ async def stream_code(websocket: WebSocket):
                                 model=Llm.GEMINI_2_0_FLASH_EXP,
                             )
                         )
-                    elif model == "anthropic":
+                    elif (
+                        model == Llm.CLAUDE_3_5_SONNET_2024_06_20
+                        or model == Llm.CLAUDE_3_5_SONNET_2024_10_22
+                    ):
                         if anthropic_api_key is None:
                             await throw_error("Anthropic API key is missing.")
                             raise Exception("Anthropic API key is missing.")
@@ -351,6 +339,7 @@ async def stream_code(websocket: WebSocket):
                     if isinstance(completion, Exception):
                         completions[index] = ""
                         print("Generation failed for variant", index)
+                        print(completion)
 
                 print("Models used for generation: ", variant_models)
 
