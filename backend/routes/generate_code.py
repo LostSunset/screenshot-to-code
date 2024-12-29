@@ -16,6 +16,7 @@ from config import (
 )
 from custom_types import InputMode
 from llm import (
+    Completion,
     Llm,
     stream_claude_response,
     stream_claude_response_native,
@@ -80,6 +81,7 @@ class ExtractedParams:
     openai_api_key: str | None
     anthropic_api_key: str | None
     openai_base_url: str | None
+    generation_type: Literal["create", "update"]
 
 
 async def extract_params(
@@ -121,6 +123,13 @@ async def extract_params(
     # Get the image generation flag from the request. Fall back to True if not provided.
     should_generate_images = bool(params.get("isImageGenerationEnabled", True))
 
+    # Extract and validate generation type
+    generation_type = params.get("generationType", "create")
+    if generation_type not in ["create", "update"]:
+        await throw_error(f"Invalid generation type: {generation_type}")
+        raise ValueError(f"Invalid generation type: {generation_type}")
+    generation_type = cast(Literal["create", "update"], generation_type)
+
     return ExtractedParams(
         stack=validated_stack,
         input_mode=validated_input_mode,
@@ -128,6 +137,7 @@ async def extract_params(
         openai_api_key=openai_api_key,
         anthropic_api_key=anthropic_api_key,
         openai_base_url=openai_base_url,
+        generation_type=generation_type,
     )
 
 
@@ -187,6 +197,7 @@ async def stream_code(websocket: WebSocket):
     openai_base_url = extracted_params.openai_base_url
     anthropic_api_key = extracted_params.anthropic_api_key
     should_generate_images = extracted_params.should_generate_images
+    generation_type = extracted_params.generation_type
 
     print(f"Generating {stack} code in {input_mode} mode")
 
@@ -214,7 +225,10 @@ async def stream_code(websocket: WebSocket):
         await send_message("chunk", content, variantIndex)
 
     if SHOULD_MOCK_AI_RESPONSE:
-        completions = [await mock_completion(process_chunk, input_mode=input_mode)]
+        completion_results = [
+            await mock_completion(process_chunk, input_mode=input_mode)
+        ]
+        completions = [result["code"] for result in completion_results]
     else:
         try:
             if input_mode == "video":
@@ -224,7 +238,7 @@ async def stream_code(websocket: WebSocket):
                     )
                     raise Exception("No Anthropic key")
 
-                completions = [
+                completion_results = [
                     await stream_claude_response_native(
                         system_prompt=VIDEO_PROMPT,
                         messages=prompt_messages,  # type: ignore
@@ -234,6 +248,7 @@ async def stream_code(websocket: WebSocket):
                         include_thinking=True,
                     )
                 ]
+                completions = [result["code"] for result in completion_results]
             else:
 
                 # Depending on the presence and absence of various keys,
@@ -242,7 +257,7 @@ async def stream_code(websocket: WebSocket):
 
                 # For creation, use Claude Sonnet 3.6 but it can be lazy
                 # so for updates, we use Claude Sonnet 3.5
-                if params["generationType"] == "create":
+                if generation_type == "create":
                     claude_model = Llm.CLAUDE_3_5_SONNET_2024_10_22
                 else:
                     claude_model = Llm.CLAUDE_3_5_SONNET_2024_06_20
@@ -268,9 +283,9 @@ async def stream_code(websocket: WebSocket):
                     )
                     raise Exception("No OpenAI or Anthropic key")
 
-                tasks: List[Coroutine[Any, Any, str]] = []
+                tasks: List[Coroutine[Any, Any, Completion]] = []
                 for index, model in enumerate(variant_models):
-                    if model == Llm.GPT_4O_2024_11_20:
+                    if model == Llm.GPT_4O_2024_11_20 or model == Llm.O1_2024_12_17:
                         if openai_api_key is None:
                             await throw_error("OpenAI API key is missing.")
                             raise Exception("OpenAI API key is missing.")
@@ -281,7 +296,7 @@ async def stream_code(websocket: WebSocket):
                                 api_key=openai_api_key,
                                 base_url=openai_base_url,
                                 callback=lambda x, i=index: process_chunk(x, i),
-                                model=Llm.GPT_4O_2024_11_20,
+                                model=model,
                             )
                         )
                     elif model == Llm.GEMINI_2_0_FLASH_EXP and GEMINI_API_KEY:
@@ -322,26 +337,33 @@ async def stream_code(websocket: WebSocket):
 
                 # If all generations failed, throw an error
                 all_generations_failed = all(
-                    isinstance(completion, Exception) for completion in completions
+                    isinstance(completion, BaseException) for completion in completions
                 )
                 if all_generations_failed:
                     await throw_error("Error generating code. Please contact support.")
 
                     # Print the all the underlying exceptions for debugging
                     for completion in completions:
-                        traceback.print_exception(
-                            type(completion), completion, completion.__traceback__
-                        )
+                        if isinstance(completion, BaseException):
+                            traceback.print_exception(completion)
                     raise Exception("All generations failed")
 
                 # If some completions failed, replace them with empty strings
                 for index, completion in enumerate(completions):
-                    if isinstance(completion, Exception):
-                        completions[index] = ""
+                    if isinstance(completion, BaseException):
+                        completions[index] = Completion(duration=0, code="")
                         print("Generation failed for variant", index)
                         print(completion)
+                    else:
+                        print(
+                            f"{variant_models[index].value} completion took {completion['duration']:.2f} seconds"
+                        )
 
-                print("Models used for generation: ", variant_models)
+                completions = [
+                    result["code"]
+                    for result in completions
+                    if not isinstance(result, BaseException)
+                ]
 
         except openai.AuthenticationError as e:
             print("[GENERATE_CODE] Authentication failed", e)
